@@ -39,10 +39,24 @@ load_dotenv()
 
 def encode_image(path: str) -> tuple[str, str]:
     """Return (base64_data, media_type) for a local image file."""
+    # Open image to detect actual format (not just extension)
+    img = Image.open(path)
+    format_lower = img.format.lower() if img.format else "png"
+    
+    # Map PIL format to media type
+    format_map = {
+        "png": "image/png",
+        "jpeg": "image/jpeg",
+        "jpg": "image/jpeg",
+        "webp": "image/webp",
+        "gif": "image/gif",
+    }
+    media_type = format_map.get(format_lower, "image/png")
+    
+    # Read and encode the file
     with open(path, "rb") as f:
         data = base64.standard_b64encode(f.read()).decode("utf-8")
-    ext = os.path.splitext(path)[1].lower()
-    media_type = "image/png" if ext == ".png" else "image/jpeg"
+    
     return data, media_type
 
 
@@ -175,7 +189,7 @@ def run_agent(
 
     tools = [
         {
-            "type": "computer_20241022",
+            "type": "computer_20251124",
             "name": "computer",
             "display_width_px": screen_w,
             "display_height_px": screen_h,
@@ -188,11 +202,11 @@ def run_agent(
 
     for turn in range(max_turns):
         response = client.beta.messages.create(
-            model="claude-opus-4-5-20251101",
+            model="claude-sonnet-4-6",
             max_tokens=4096,
             tools=tools,
             messages=messages,
-            betas=["computer-use-2024-10-22"],
+            betas=["computer-use-2025-11-24"],
         )
 
         # Collect all content blocks for this turn
