@@ -1,0 +1,4 @@
+anthropic
+pyautogui
+pillow
+python-dotenv
