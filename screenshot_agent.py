@@ -27,6 +27,8 @@ import base64
 import argparse
 import os
 import time
+import queue
+import threading
 from PIL import Image
 from io import BytesIO
 from dotenv import load_dotenv
@@ -266,6 +268,41 @@ def execute_action(
     }]
 
 
+_hint_queue: queue.Queue = queue.Queue()
+
+
+def _stdin_listener():
+    """Background thread: reads lines from stdin and puts them in the hint queue."""
+    import sys
+    while True:
+        try:
+            line = sys.stdin.readline()
+            if line == "":  # EOF
+                break
+            line = line.strip()
+            if line:
+                _hint_queue.put(line)
+        except Exception:
+            break
+
+
+def start_hint_listener():
+    """Start the background stdin listener (call once at startup)."""
+    t = threading.Thread(target=_stdin_listener, daemon=True)
+    t.start()
+
+
+def drain_hints() -> str:
+    """Return all pending hints joined as a single string, or empty string if none."""
+    hints = []
+    while not _hint_queue.empty():
+        try:
+            hints.append(_hint_queue.get_nowait())
+        except queue.Empty:
+            break
+    return "\n".join(hints)
+
+
 # ── Core Agent ────────────────────────────────────────────────────────────────
 
 def run_agent(
@@ -273,6 +310,10 @@ def run_agent(
     old_screenshot_path: str,
     doc_path: str,
     output_path: str,
+    context: str = "",
+    model: str = "claude-sonnet-4-6",
+    system_prompt: str = "",
+    user_prompt: str = "",
 ):
     client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 
@@ -282,13 +323,40 @@ def run_agent(
     screen_w, screen_h = pyautogui.size()          # logical points
     target_w, target_h, tool_to_logical_scale = compute_target_display_size(screen_w, screen_h)
 
+    context_text = ""
+    if context:
+        if os.path.isfile(context):
+            with open(context, "r", encoding="utf-8") as f:
+                context_text = f.read()
+        else:
+            context_text = context
+
+    app_context_section = f"## App Context\n{context_text}\n\n" if context_text else ""
+
+    # Resolve system prompt (file or inline string)
+    resolved_system = ""
+    if system_prompt:
+        if os.path.isfile(system_prompt):
+            with open(system_prompt, "r", encoding="utf-8") as f:
+                resolved_system = f.read()
+        else:
+            resolved_system = system_prompt
+
     print(f"\n📄 Doc loaded: {doc_path}")
     print(f"🖼  Old screenshot: {old_screenshot_path}")
+    if context_text:
+        print(f"🧠 Context: {context[:60]}{'...' if len(context) > 60 else ''}")
+    if resolved_system:
+        print(f"📋 System prompt: {resolved_system[:60]}{'...' if len(resolved_system) > 60 else ''}")
+    if user_prompt:
+        print(f"💬 Extra prompt: {user_prompt[:60]}{'...' if len(user_prompt) > 60 else ''}")
+    print(f"🤖 Model: {model}")
     print(
         f"📐 Screen: {screen_w}×{screen_h} logical pts  "
         f"(tool: {target_w}×{target_h}, tool→logical scale={tool_to_logical_scale:.3f})"
     )
-    print(f"🎯 Output: {output_path}\n")
+    print(f"🎯 Output: {output_path}")
+    print(f"\n💡 Tip: Type a hint and press Enter at any time to guide Claude.\n")
 
     # Build the initial prompt with old screenshot + doc as context
     initial_message = {
@@ -298,6 +366,7 @@ def run_agent(
                 "type": "text",
                 "text": (
                     f"You are a documentation screenshot agent for the app '{app_name}'.\n\n"
+                    f"{app_context_section}"
                     f"## Your job\n"
                     f"The app has a new UI. I need you to:\n"
                     f"1. Read the documentation excerpt below to understand WHERE this screenshot is taken\n"
@@ -324,6 +393,7 @@ def run_agent(
                 "text": (
                     f"Now take a screenshot of the current screen to see where we are, "
                     f"then navigate to the correct screen in '{app_name}'."
+                    + (f"\n\n{user_prompt}" if user_prompt else "")
                 )
             }
         ]
@@ -332,7 +402,7 @@ def run_agent(
     # Tell Claude the exact dimensions used for tool screenshots (downscaled logical space).
     tools = [
         {
-            "type": "computer_20251124",
+            "type": "computer_20250124",
             "name": "computer",
             "display_width_px": target_w,
             "display_height_px": target_h,
@@ -383,13 +453,16 @@ def run_agent(
             pruned.append({**m, "content": new_content})
         return pruned
 
+    start_hint_listener()
+
     for turn in range(max_turns):
         response = client.beta.messages.create(
-            model="claude-sonnet-4-6",
+            model=model,
             max_tokens=4096,
             tools=tools,
             messages=messages,
-            betas=["computer-use-2025-11-24"],
+            betas=["computer-use-2025-01-24"],
+            **({"system": resolved_system} if resolved_system else {}),
         )
 
         # Collect all content blocks for this turn
@@ -419,13 +492,24 @@ def run_agent(
                 tool_to_logical_scale=tool_to_logical_scale,
             )
             messages.append({"role": "assistant", "content": response.content})
+            
+            user_message_content = [{
+                "type": "tool_result",
+                "tool_use_id": tool_use_block.id,
+                "content": result,
+            }]
+            
+            hint = drain_hints()
+            if hint:
+                print(f"\n💡 Injecting hint: {hint}")
+                user_message_content.append({
+                    "type": "text",
+                    "text": f"User hint: {hint}"
+                })
+
             messages.append({
                 "role": "user",
-                "content": [{
-                    "type": "tool_result",
-                    "tool_use_id": tool_use_block.id,
-                    "content": result,
-                }]
+                "content": user_message_content
             })
             # Prune old screenshots to avoid 413 request-too-large errors
             messages = prune_screenshots(messages, keep_last=2)
@@ -450,10 +534,18 @@ def main():
                         help="Path to the OLD screenshot (png/jpg)")
     parser.add_argument("--doc", required=True,
                         help="Path to the doc file containing navigation context (md/txt/html)")
-    parser.add_argument("--app", required=True,
-                        help="Name of the app to navigate (e.g. 'Slack')")
+    parser.add_argument("--app", default="Xogot",
+                        help="Name of the app to navigate (default: 'Xogot')")
     parser.add_argument("--out", required=True,
                         help="Where to save the new screenshot (e.g. docs/screenshots/settings.png)")
+    parser.add_argument("--context", default="",
+                        help="Additional context about the app (string or path to text file)")
+    parser.add_argument("--model", default="claude-sonnet-4-6",
+                        help="Anthropic model to use (default: claude-sonnet-4-6)")
+    parser.add_argument("--system", default="",
+                        help="System prompt for Claude (string or path to text file)")
+    parser.add_argument("--prompt", default="",
+                        help="Extra instruction appended to the initial user message")
 
     args = parser.parse_args()
 
@@ -465,6 +557,10 @@ def main():
         old_screenshot_path=args.screenshot,
         doc_path=args.doc,
         output_path=args.out,
+        context=args.context,
+        model=args.model,
+        system_prompt=args.system,
+        user_prompt=args.prompt,
     )
 
 
