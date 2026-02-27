@@ -27,7 +27,7 @@ Automated screenshot capture using Claude's computer use API. Give it an old scr
 ## Usage
 
 ```bash
-python screenshot_agent.py \
+python main.py \
     --screenshot old_screenshot.png \
     --doc path/to/doc_page.md \
     --app "YourAppName" \
@@ -36,7 +36,7 @@ python screenshot_agent.py \
 
 **Example:**
 ```bash
-python screenshot_agent.py \
+python main.py \
     --screenshot docs/old/settings.png \
     --doc docs/user-guide.md \
     --app "Xogot" \
