@@ -45,6 +45,7 @@ except Exception:
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 MAX_IMAGE_BYTES = 4 * 1024 * 1024  # 4 MB — safely under the 5 MB API limit
+MAX_TOOL_WIDTH = 1280
 
 
 def compress_image_for_api(img: Image.Image, preserve_dimensions: bool = False) -> tuple[str, str]:
@@ -120,6 +121,48 @@ def get_retina_scale() -> float:
         return 1.0
 
 
+def compute_target_display_size(logical_w: int, logical_h: int, max_width: int = MAX_TOOL_WIDTH) -> tuple[int, int, float]:
+    """Return (target_w, target_h, tool_to_logical_scale).
+
+    Claude operates in target display coordinates. PyAutoGUI uses logical points.
+    `tool_to_logical_scale` converts tool coords back to logical coords.
+    """
+    if logical_w > max_width:
+        downscale = max_width / logical_w
+        target_w = max_width
+        target_h = int(logical_h * downscale)
+    else:
+        target_w = logical_w
+        target_h = logical_h
+
+    tool_to_logical_scale = target_w / logical_w
+    return target_w, target_h, tool_to_logical_scale
+
+
+def encode_agent_screenshot_for_tool(logical_w: int, logical_h: int, target_w: int, target_h: int) -> tuple[str, str]:
+    """Capture the current screen and encode for Claude in target tool dimensions.
+
+    On Retina displays, pyautogui.screenshot() can return pixel dimensions larger than
+    logical points. Normalize to logical dimensions first, then resize to target tool
+    dimensions so coordinates are consistent with the declared display size.
+    """
+    screenshot = pyautogui.screenshot()
+
+    if screenshot.width != logical_w or screenshot.height != logical_h:
+        screenshot = screenshot.resize((logical_w, logical_h), Image.LANCZOS)
+
+    if logical_w != target_w or logical_h != target_h:
+        screenshot = screenshot.resize((target_w, target_h), Image.LANCZOS)
+
+    buf = BytesIO()
+    screenshot.save(buf, format="PNG", optimize=True)
+    png_bytes = buf.getvalue()
+    if len(png_bytes) <= MAX_IMAGE_BYTES:
+        return base64.standard_b64encode(png_bytes).decode("utf-8"), "image/png"
+
+    return compress_image_for_api(screenshot, preserve_dimensions=True)
+
+
 def take_screenshot() -> str:
     """Capture the full screen and return as a compressed base64 image."""
     screenshot = pyautogui.screenshot()
@@ -133,18 +176,45 @@ def save_screenshot(path: str):
     pyautogui.screenshot().save(path)
     print(f"  💾 Saved: {path}")
 
-def execute_action(action_input: dict, scale: float = 1.0) -> list:
+def normalize_key_token(token: str) -> str:
+    token = token.strip().lower()
+    special_keys = {
+        "super": "command",
+        "cmd": "command",
+        "meta": "command",
+        "control": "ctrl",
+        "return": "enter",
+        "esc": "escape",
+        "del": "delete",
+        "pgup": "pageup",
+        "pgdn": "pagedown",
+        "spacebar": "space",
+    }
+    return special_keys.get(token, token)
+
+
+def execute_action(
+    action_input: dict,
+    logical_w: int,
+    logical_h: int,
+    target_w: int,
+    target_h: int,
+    tool_to_logical_scale: float = 1.0,
+) -> list:
     """Execute a computer-use action and return a fresh screenshot.
 
-    On Retina Macs the screenshots sent to Claude are at 2× pixel resolution,
-    but PyAutoGUI expects logical-point coordinates. Divide all pixel coordinates
-    from Claude by `scale` (typically 2.0 on Retina) before acting.
+    Claude coordinates are in target tool display space. PyAutoGUI expects logical
+    point coordinates. Divide by `tool_to_logical_scale` to map back.
     """
     action = action_input.get("action")
 
     def to_logical(coord):
-        """Convert a pixel coordinate (as Claude sees it) to a logical point."""
-        return int(coord[0] / scale), int(coord[1] / scale)
+        """Convert a tool-display coordinate (as Claude sees it) to logical point."""
+        x = int(coord[0] / tool_to_logical_scale)
+        y = int(coord[1] / tool_to_logical_scale)
+        x = max(0, min(logical_w - 1, x))
+        y = max(0, min(logical_h - 1, y))
+        return x, y
 
     if action == "left_click":
         x, y = to_logical(action_input["coordinate"])
@@ -174,20 +244,22 @@ def execute_action(action_input: dict, scale: float = 1.0) -> list:
         # API may send 'key' or 'keys' depending on version
         key_str = action_input.get("key") or action_input.get("keys", "")
         if key_str:
-            keys = key_str.replace("+", " ")
-            pyautogui.hotkey(*keys.split())
+            normalized = [normalize_key_token(part) for part in key_str.replace("+", " ").split() if part.strip()]
+            if len(normalized) == 1:
+                pyautogui.press(normalized[0])
+            elif normalized:
+                pyautogui.hotkey(*normalized)
         time.sleep(0.2)
 
     elif action == "scroll":
-        x, y = to_logical(action_input["coordinate"])
+        x, y = to_logical(action_input.get("coordinate", [logical_w // 2, logical_h // 2]))
         direction = action_input.get("direction", "down")
         amount = action_input.get("amount", 3)
         pyautogui.scroll(amount if direction == "up" else -amount, x=x, y=y)
         time.sleep(0.2)
 
     # Always return current screen state
-    screenshot = pyautogui.screenshot()
-    screenshot_b64, screenshot_media_type = compress_image_for_api(screenshot, preserve_dimensions=True)
+    screenshot_b64, screenshot_media_type = encode_agent_screenshot_for_tool(logical_w, logical_h, target_w, target_h)
     return [{
         "type": "image",
         "source": {"type": "base64", "media_type": screenshot_media_type, "data": screenshot_b64}
@@ -208,13 +280,14 @@ def run_agent(
     old_img_b64, old_img_type = encode_image(old_screenshot_path)
     doc_text = read_doc(doc_path)
     screen_w, screen_h = pyautogui.size()          # logical points
-    retina_scale = get_retina_scale()               # 2.0 on Retina, 1.0 otherwise
-    pixel_w = int(screen_w * retina_scale)          # actual screenshot pixel width
-    pixel_h = int(screen_h * retina_scale)          # actual screenshot pixel height
+    target_w, target_h, tool_to_logical_scale = compute_target_display_size(screen_w, screen_h)
 
     print(f"\n📄 Doc loaded: {doc_path}")
     print(f"🖼  Old screenshot: {old_screenshot_path}")
-    print(f"📐 Screen: {screen_w}×{screen_h} logical pts  ({pixel_w}×{pixel_h} px, scale={retina_scale:.1f}×)")
+    print(
+        f"📐 Screen: {screen_w}×{screen_h} logical pts  "
+        f"(tool: {target_w}×{target_h}, tool→logical scale={tool_to_logical_scale:.3f})"
+    )
     print(f"🎯 Output: {output_path}\n")
 
     # Build the initial prompt with old screenshot + doc as context
@@ -256,14 +329,13 @@ def run_agent(
         ]
     }
 
-    # Tell Claude the actual pixel dimensions of the screenshots it will receive.
-    # On Retina displays this is 2× the logical size returned by pyautogui.size().
+    # Tell Claude the exact dimensions used for tool screenshots (downscaled logical space).
     tools = [
         {
             "type": "computer_20251124",
             "name": "computer",
-            "display_width_px": pixel_w,
-            "display_height_px": pixel_h,
+            "display_width_px": target_w,
+            "display_height_px": target_h,
             "display_number": 1,
         }
     ]
@@ -338,7 +410,14 @@ def run_agent(
                 print(f"  → {action} {coord}")
 
         if tool_use_block:
-            result = execute_action(tool_use_block.input, scale=retina_scale)
+            result = execute_action(
+                tool_use_block.input,
+                logical_w=screen_w,
+                logical_h=screen_h,
+                target_w=target_w,
+                target_h=target_h,
+                tool_to_logical_scale=tool_to_logical_scale,
+            )
             messages.append({"role": "assistant", "content": response.content})
             messages.append({
                 "role": "user",
