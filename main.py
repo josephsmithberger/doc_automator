@@ -253,7 +253,12 @@ def run_agent(app: str, screenshot: str, doc: str, output: str,
         ]
     }
 
-    tools = [{"type": "computer_20250124", "name": "computer",
+    # Claude 4.6 (Sonnet/Opus) use computer_20251124, Haiku 4.5 uses computer_20250124
+    is_new_model = "4.6" in model.lower() or "4-6" in model.lower()
+    tool_type = "computer_20251124" if is_new_model else "computer_20250124"
+    beta_version = "computer-use-2025-11-24" if is_new_model else "computer-use-2025-01-24"
+    
+    tools = [{"type": tool_type, "name": "computer",
               "display_width_px": tw, "display_height_px": th, "display_number": 1}]
     messages = [initial]
     start_hint_listener()
@@ -261,7 +266,7 @@ def run_agent(app: str, screenshot: str, doc: str, output: str,
     for turn in range(30):
         response = client.beta.messages.create(
             model=model, max_tokens=4096, tools=tools, messages=messages,
-            betas=["computer-use-2025-01-24"],
+            betas=[beta_version],
             **({"system": system_text} if system_text else {}),
         )
 
